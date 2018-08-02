@@ -3,12 +3,13 @@ package main
 import (
 	"bufio"
 	"crypto/md5"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"runtime"
-	"strings"
 	"sync"
 
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
@@ -28,25 +29,25 @@ func runCmd(command string) (string, error) {
 
 func openFile(cmd string) (*os.File, error) {
 	filename := fmt.Sprintf(".%x.conf", md5.Sum([]byte(cmd)))
-	fp, err := os.OpenFile(filename, os.O_RDWR|os.O_APPEND, 0644)
+	fp, err := os.Open(filename)
 	if err == nil {
 		return fp, err
 	}
 
-	fp, _ = os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
+	fp, _ = os.OpenFile(filename, os.O_WRONLY|os.O_CREATE, 0644)
 	return fp, fmt.Errorf("file created")
 }
 
-func loadStatuses(fp *os.File) map[string]string {
-	statuses := make(map[string]string)
+func loadStatuses(fp *os.File) (map[string]string, error) {
+	var statuses map[string]string
 
-	scanner := bufio.NewScanner(fp)
-	for scanner.Scan() {
-		state := strings.SplitN(scanner.Text(), "\t", 2)
-		statuses[state[1]] = state[0]
+	b, err := ioutil.ReadAll(fp)
+	if err != nil {
+		return map[string]string{}, err
 	}
 
-	return statuses
+	err = json.Unmarshal(b, &statuses)
+	return statuses, err
 }
 
 func stateLog(state, arg string) string {
@@ -72,7 +73,11 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		statuses := loadStatuses(fp)
+		defer fp.Close()
+		statuses, err := loadStatuses(fp)
+		if err != nil {
+			log.Fatal(err)
+		}
 
 		for arg, state := range statuses {
 			if state == "fail" {
@@ -92,15 +97,41 @@ func main() {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
+	var filename string
 	fp, err := openFile(*cmd)
+	filename = fp.Name()
+	var isCreated bool
 	if err != nil {
 		fmt.Println(fmt.Sprintf("create %s", fp.Name()))
+		isCreated = true
 	} else {
 		fmt.Println(fmt.Sprintf("load %s", fp.Name()))
 	}
-	defer fp.Close()
 
-	statuses := loadStatuses(fp)
+	var statuses map[string]string
+
+	if !isCreated {
+		statuses, err = loadStatuses(fp)
+		if err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		statuses = make(map[string]string)
+	}
+
+	var jb []byte
+	defer func() {
+		fp.Close()
+
+		if len(jb) > 0 {
+			fp, err = os.OpenFile(filename, os.O_TRUNC|os.O_WRONLY, 0644)
+			_, err = fp.Write(jb)
+			if err != nil {
+				log.Fatal(err)
+			}
+			fp.Close()
+		}
+	}()
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
@@ -117,20 +148,24 @@ func main() {
 				c := fmt.Sprintf("%s %s", *cmd, arg)
 				log.Println(c)
 				out, err := runCmd(c)
-				var cmdlog string
+
 				if err != nil {
 					log.Println(err)
-					cmdlog = stateLog("fail", arg)
+					statuses[arg] = "fail"
 				} else {
-					cmdlog = stateLog("success", arg)
+					statuses[arg] = "success"
 				}
 
 				if out != "" {
 					log.Println(out)
 				}
 				mu.Lock()
-				fmt.Fprintln(fp, cmdlog)
-				mu.Unlock()
+				defer mu.Unlock()
+
+				jb, err = json.Marshal(statuses)
+				if err != nil {
+					log.Fatal(err)
+				}
 			}
 		}(scanner.Text())
 	}
